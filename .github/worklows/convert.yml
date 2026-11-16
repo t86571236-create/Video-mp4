@@ -1,0 +1,259 @@
+name: Convert videos
+
+on:
+  push:
+    paths:
+      - '*.mp4'
+      - '**/*.mp4'
+      - '.github/workflows/convert.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ffmpeg and Python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install numpy librosa
+
+      - name: Convert every mp4 and write list.txt
+        run: |
+          python - <<'PYTHON_SCRIPT'
+          #!/usr/bin/env python3
+          """Turns every .mp4 in the repo into videos/<name>.vid and writes list.txt.
+
+          .vid format (all numbers little-endian):
+            "ZVID"                         4 bytes   magic
+            version                        u8        (1)
+            width, height                  u16, u16
+            fps * 1000                     u32
+            frame count                    u32
+            audio event count              u32
+            audio events                   7 bytes each: time in ms u32, pitch * 1000 u16, volume * 100 u8
+            frame sizes                    u32 each
+            frames                         JPEG data, one after the other
+
+          The audio is remade as experience orb pickup sounds: the melody is tracked
+          and every note becomes one sound with its own pitch and volume.
+          """
+          import hashlib
+          import json
+          import os
+          import re
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          from fractions import Fraction
+          from pathlib import Path
+
+          CONVERTER_VERSION = "1"
+          WIDTH = 160
+          QUALITIES = [6, 10, 16, 24]            # ffmpeg -q:v, lower is better; tried in order until the file fits
+          MAX_VID_BYTES = 90 * 1024 * 1024       # GitHub refuses files over 100 MB
+
+          ROOT = Path.cwd()
+          OUT_DIR = ROOT / "videos"
+          LIST_FILE = ROOT / "list.txt"
+          MANIFEST = OUT_DIR / "manifest.json"
+
+
+          def run(cmd):
+              return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+          def find_mp4s():
+              found = []
+              for folder, dirs, files in os.walk(ROOT):
+                  dirs[:] = [d for d in dirs if not d.startswith(".") and Path(folder, d) != OUT_DIR]
+                  for name in files:
+                      if name.lower().endswith(".mp4"):
+                          found.append(Path(folder, name))
+              return sorted(found, key=lambda p: p.relative_to(ROOT).as_posix().lower())
+
+
+          def sha1(path):
+              h = hashlib.sha1()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def probe(path):
+              info = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)]))
+              video = next((s for s in info["streams"] if s.get("codec_type") == "video"), None)
+              if video is None:
+                  raise RuntimeError("no video stream")
+              has_audio = any(s.get("codec_type") == "audio" for s in info["streams"])
+              rate = video.get("avg_frame_rate") or "0/0"
+              if rate in ("0/0", "0/1"):
+                  rate = video["r_frame_rate"]
+              fps = Fraction(rate)
+              return fps, has_audio
+
+
+          def audio_events(path, tmp):
+              """Melody -> list of (seconds, pitch, volume) for entity.experience_orb.pickup."""
+              import numpy as np
+              import librosa
+
+              wav = Path(tmp) / "audio.wav"
+              run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "22050", str(wav)])
+              y, sr = librosa.load(str(wav), sr=22050, mono=True)
+              hop = 1102                                   # about 50 ms
+              if len(y) < 4096:
+                  return []
+              f0 = librosa.yin(y, fmin=80, fmax=1000, sr=sr, frame_length=2048, hop_length=hop)
+              rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
+              n = min(len(f0), len(rms))
+              f0, rms = f0[:n], rms[:n]
+              ref = np.percentile(rms, 95)
+              if ref <= 0:
+                  return []
+              thr = np.percentile(rms, 25)
+              midi = np.round(librosa.hz_to_midi(f0)).astype(int)
+              events = []
+              last_t, last_m = -1.0, None
+              for i in range(n):
+                  t = i * hop / sr
+                  if rms[i] < thr:
+                      last_m = None
+                      continue
+                  prev = rms[i - 1] if i else 0
+                  onset = rms[i] > prev * 1.4
+                  changed = midi[i] != last_m
+                  if (changed or onset) and t - last_t >= 0.1:
+                      folded = ((int(midi[i]) - 55) % 24) + 55          # keep the note inside two octaves
+                      pitch = 2 ** ((folded - 67) / 12)                 # 0.5 .. 2.0 sound pitch
+                      vol = float(np.clip(rms[i] / ref, 0.15, 1.0))
+                      events.append((t, pitch, vol))
+                      last_t, last_m = t, int(midi[i])
+              return events
+
+
+          def extract_frames(path, quality, tmp):
+              frames_dir = Path(tmp) / f"frames_q{quality}"
+              frames_dir.mkdir()
+              run([
+                  "ffmpeg", "-v", "error", "-y", "-i", str(path),
+                  "-vf", f"scale={WIDTH}:-2", "-fps_mode", "passthrough",
+                  "-pix_fmt", "yuvj420p", "-q:v", str(quality),
+                  str(frames_dir / "f_%06d.jpg"),
+              ])
+              files = sorted(frames_dir.glob("f_*.jpg"))
+              if not files:
+                  raise RuntimeError("no frames were extracted")
+              out = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(files[0])])
+              width, height = (int(v) for v in out.strip().split(","))
+              return width, height, [f.read_bytes() for f in files]
+
+
+          def pack(width, height, fps, events, jpgs):
+              out = bytearray(b"ZVID")
+              out += struct.pack("<BHHIII", 1, width, height, int(round(float(fps) * 1000)), len(jpgs), len(events))
+              for t, pitch, vol in events:
+                  out += struct.pack("<IHB", int(round(t * 1000)), int(round(pitch * 1000)), int(round(vol * 100)))
+              for j in jpgs:
+                  out += struct.pack("<I", len(j))
+              for j in jpgs:
+                  out += j
+              return bytes(out)
+
+
+          def convert(path):
+              fps, has_audio = probe(path)
+              with tempfile.TemporaryDirectory() as tmp:
+                  events = []
+                  if has_audio:
+                      try:
+                          events = audio_events(path, tmp)
+                      except Exception as e:                      # the video is still playable without sound
+                          print(f"::warning::{path.name}: audio could not be converted ({e})")
+                  for q in QUALITIES:
+                      width, height, jpgs = extract_frames(path, q, tmp)
+                      data = pack(width, height, fps, events, jpgs)
+                      print(f"  quality {q}: {len(jpgs)} frames, {len(events)} sounds, {len(data) / 1e6:.1f} MB")
+                      if len(data) <= MAX_VID_BYTES:
+                          return data
+                  raise RuntimeError("too big for GitHub even at the lowest quality")
+
+
+          def slug_for(path, used):
+              rel = path.relative_to(ROOT).with_suffix("")
+              base = re.sub(r"[^A-Za-z0-9._-]+", "_", "__".join(rel.parts)) or "video"
+              slug, n = base, 2
+              while slug.lower() in used:
+                  slug, n = f"{base}_{n}", n + 1
+              used.add(slug.lower())
+              return slug
+
+
+          def main():
+              OUT_DIR.mkdir(exist_ok=True)
+              manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+              new_manifest, listing, used = {}, [], set()
+
+              mp4s = find_mp4s()
+              names = [p.name.lower() for p in mp4s]
+              print(f"Found {len(mp4s)} mp4 file(s)")
+
+              for path in mp4s:
+                  rel = path.relative_to(ROOT).as_posix()
+                  slug = slug_for(path, used)
+                  vid_rel = f"videos/{slug}.vid"
+                  vid_path = ROOT / vid_rel
+                  key = f"{sha1(path)}-{CONVERTER_VERSION}-{WIDTH}"
+                  display = (rel if names.count(path.name.lower()) > 1 else path.name).replace("|", "_")
+                  print(f"{rel}")
+                  if manifest.get(rel, {}).get("key") == key and vid_path.exists():
+                      print("  already converted")
+                  else:
+                      try:
+                          vid_path.write_bytes(convert(path))
+                      except Exception as e:
+                          print(f"::warning::{rel} was skipped: {e}")
+                          if vid_path.exists():
+                              vid_path.unlink()
+                          continue
+                  new_manifest[rel] = {"key": key, "vid": vid_rel}
+                  listing.append(f"{display}|{vid_rel}")
+
+              keep = {Path(v["vid"]).name for v in new_manifest.values()}
+              for old in OUT_DIR.glob("*.vid"):
+                  if old.name not in keep:
+                      old.unlink()
+                      print(f"removed {old.name}")
+
+              MANIFEST.write_text(json.dumps(new_manifest, indent=2, sort_keys=True) + "\n")
+              LIST_FILE.write_text("".join(line + "\n" for line in listing))
+              print(f"list.txt has {len(listing)} ready video(s)")
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYTHON_SCRIPT
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A videos list.txt
+          if git diff --cached --quiet; then
+            echo "Nothing changed"
+          else
+            git commit -m "Convert videos"
+            git push
+          fi
